@@ -1,12 +1,21 @@
 import { put, del } from '@vercel/blob';
 import { NextResponse } from 'next/server';
 
-// Função para validar token
-const isValidToken = (req: Request) => req.headers.get('x-audit-token') === 'audit-secret';
-
 export async function POST(request: Request): Promise<NextResponse> {
-  if (!isValidToken(request)) {
-    return NextResponse.json({ error: 'Acesso Negado' }, { status: 401 });
+  // 1. Carrega a senha das variáveis de ambiente
+  const SECRET = process.env.AUDIT_SECRET;
+
+  // Segurança extra: Se a variável não estiver configurada no servidor, bloqueia tudo.
+  if (!SECRET) {
+    console.error('ERRO: AUDIT_SECRET não configurado no ambiente.');
+    return NextResponse.json({ error: 'Erro de configuração no servidor' }, { status: 500 });
+  }
+
+  // 2. Validação do Token
+  const token = request.headers.get('x-audit-token');
+  
+  if (token !== SECRET) {
+    return NextResponse.json({ error: 'Acesso Negado: Credenciais inválidas' }, { status: 401 });
   }
 
   const { searchParams } = new URL(request.url);
@@ -16,7 +25,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'Arquivo inválido' }, { status: 400 });
   }
 
-  // Lista de extensões permitidas expandida
+  // Validação de Extensão (Mantida)
   const allowedExtensions = ['.txt', '.docx', '.png', '.jpg', '.jpeg', '.log', '.csv', '.xlsx', '.xls', '.pdf', '.json'];
   const isAllowed = allowedExtensions.some(ext => filename.toLowerCase().endsWith(ext));
   
@@ -24,13 +33,19 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'Extensão bloqueada.' }, { status: 403 });
   }
 
+  // O Vercel Blob lê automaticamente o BLOB_READ_WRITE_TOKEN do ambiente,
+  // não precisamos passar manualmente aqui.
   const blob = await put(filename, request.body, { access: 'public' });
+
   return NextResponse.json(blob);
 }
 
-// Nova rota DELETE para apagar arquivos
+// Atualize também o DELETE seguindo a mesma lógica
 export async function DELETE(request: Request): Promise<NextResponse> {
-  if (!isValidToken(request)) {
+  const SECRET = process.env.AUDIT_SECRET;
+  const token = request.headers.get('x-audit-token');
+
+  if (!SECRET || token !== SECRET) {
     return NextResponse.json({ error: 'Acesso Negado' }, { status: 401 });
   }
 
