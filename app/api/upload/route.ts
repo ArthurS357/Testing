@@ -1,5 +1,10 @@
 import { put, del } from '@vercel/blob';
 import { NextResponse } from 'next/server';
+import zlib from 'zlib'; // Biblioteca nativa para descompressão (Novo na v6.0)
+import { promisify } from 'util';
+
+// Promisify para usar async/await com gzip
+const gunzip = promisify(zlib.gunzip);
 
 // Função auxiliar de Descriptografia XOR (Simétrica)
 // Reverte o processo feito no Frontend para recuperar o Base64 original
@@ -12,7 +17,7 @@ const xorDecrypt = (base64Input: string, key: string = "audit-key") => {
     // 2. Aplica XOR reverso (mesma operação)
     result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
   }
-  return result; // Retorna a string Base64 original do arquivo (com headers data:...)
+  return result; // Retorna a string Base64 original
 };
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -33,7 +38,7 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // 3. Captura de Parâmetros
   const { searchParams } = new URL(request.url);
-  // Nota: No modo stealth, 'filename' pode ser falso (ex: error_log.txt)
+  // Nota: No modo stealth, 'filename' pode ser falso (ex: background.png) para enganar filtros de URL
   let filename = searchParams.get('filename');
   const mode = searchParams.get('mode');
 
@@ -41,27 +46,12 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'Nome do arquivo necessário' }, { status: 400 });
   }
 
-  // 4. Validação de Extensões (Lista Completa)
+  // 4. Validação de Extensões (Lista Ampliada na v6.0)
+  // Adicionados formatos comuns de web assets para spoofing (.dat, .bin, etc)
   const allowedExtensions = [
-    // Documentos e Imagens
     '.txt', '.docx', '.doc', '.png', '.jpg', '.jpeg', '.gif', '.log', '.csv', '.xlsx', '.xls', '.pdf', '.json', '.zip', '.rar',
-    // Códigos e Scripts
-    '.py',   // Python
-    '.js',   // JavaScript
-    '.jsx',  // React JS
-    '.ts',   // TypeScript
-    '.tsx',  // React TS
-    '.java', // Java
-    '.c',    // C
-    '.cpp',  // C++
-    '.cs',   // C#
-    '.go',   // Go
-    '.rb',   // Ruby
-    '.php',  // PHP
-    '.sh',   // Shell Script
-    '.bat',  // Batch
-    '.sql',  // SQL
-    '.html', '.css', '.xml', '.yaml', '.yml', '.md', '.env', '.ini' // Web & Config
+    '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.c', '.cpp', '.cs', '.go', '.rb', '.php', '.sh', '.bat', '.sql',
+    '.html', '.css', '.xml', '.yaml', '.yml', '.md', '.env', '.ini', '.dat', '.bin'
   ];
 
   // Validação preliminar da URL (Proxy/WAF check)
@@ -78,12 +68,12 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   if (mode === 'stealth') {
     try {
-      // MODO STEALTH v2 (Payload Camuflado + XOR)
+      // MODO STEALTH v6 (Payload Camuflado + XOR + Gzip)
       const jsonBody = await request.json();
 
-      // Verifica se é o payload novo (mimicry) ou o antigo
-      const encryptedPayload = jsonBody.payload || jsonBody.fileData;
+      const encryptedPayload = jsonBody.payload;
       const realName = jsonBody.realName;
+      const isCompressed = jsonBody.compression; // Flag de compressão vinda do front (Novo na v6.0)
 
       if (!encryptedPayload) {
         throw new Error('Payload criptografado ausente');
@@ -95,20 +85,31 @@ export async function POST(request: Request): Promise<NextResponse> {
       }
 
       // 1. Descriptografa (XOR)
-      const decryptedBase64 = xorDecrypt(encryptedPayload);
+      const decryptedData = xorDecrypt(encryptedPayload);
 
-      // 2. Remove o cabeçalho do Data URL (ex: "data:application/pdf;base64,")
-      // Isso é necessário porque o FileReader do JS inclui isso no começo
-      const base64Clean = decryptedBase64.includes(',')
-        ? decryptedBase64.split(',').pop()
-        : decryptedBase64;
+      // 2. Converte Base64 para Buffer
+      // Se houver compressão, o Base64 gerado é "puro". Se não, removemos o header 'data:...'
+      const base64Clean = decryptedData.includes(',')
+        ? decryptedData.split(',').pop()
+        : decryptedData;
 
-      // 3. Converte para Buffer binário para salvar
-      fileBody = Buffer.from(base64Clean!, 'base64');
+      let buffer = Buffer.from(base64Clean!, 'base64');
+
+      // 3. Descomprime (Lógica v6.0)
+      if (isCompressed) {
+        try {
+          buffer = await gunzip(buffer);
+        } catch (zipError) {
+          console.error("Erro na descompressão:", zipError);
+          return NextResponse.json({ error: 'Falha ao descomprimir (Gzip Error)' }, { status: 400 });
+        }
+      }
+
+      fileBody = buffer;
 
     } catch (e) {
-      console.error('Erro no modo Stealth:', e);
-      return NextResponse.json({ error: 'Falha ao processar payload cifrado' }, { status: 400 });
+      console.error('Stealth Error:', e);
+      return NextResponse.json({ error: 'Falha ao processar payload stealth' }, { status: 400 });
     }
   } else {
     // MODO NORMAL (Stream direto)
