@@ -30,10 +30,10 @@ export default function AuditPage() {
   const [token, setToken] = useState('');
   const [status, setStatus] = useState({ msg: '', type: '' });
   const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState(''); // NOVO: Indicador de progresso das partes
+  const [progress, setProgress] = useState(''); // Barra de progresso textual
   const [isDragging, setIsDragging] = useState(false);
 
-  // Estados de Dados
+  // Estados de Dados (Paginação e Busca v7.2)
   const [files, setFiles] = useState<BlobFile[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
@@ -131,33 +131,26 @@ export default function AuditPage() {
     return hex;
   };
 
-  // --- UPLOAD PROCESS (Atualizado: Stealth v8.0 - Fragmentação) ---
+  // --- UPLOAD PROCESS (Stealth v8.0 - Fragmentação) ---
   const handleUploadProcess = async (file: File) => {
     if (!token) { showStatus('Token necessário.', 'error'); return; }
     setLoading(true);
     setProgress('Iniciando...');
 
     try {
-      // Limite seguro para Vercel Functions (JSON Body) ~3MB para deixar margem
-      const CHUNK_SIZE = 1024 * 1024 * 3;
+      const CHUNK_SIZE = 1024 * 1024 * 3; // 3MB chunks
 
       if (stealthMode) {
-        // >>> MODO STEALTH FRAGMENTADO <<<
-
         let fileDataToProcess: Uint8Array | string;
 
-        // 1. Preparação (Compressão Global ou Leitura)
-        // Comprimimos o arquivo INTEIRO antes de fatiar para melhor taxa
         if (useCompression) {
-          setProgress('Comprimindo arquivo...');
-          fileDataToProcess = await compressFile(file); // Retorna Uint8Array
+          setProgress('Comprimindo...');
+          fileDataToProcess = await compressFile(file);
         } else {
-          // Se não comprimir, lemos como string base64 para processar
           const b64 = await blobToBase64(file);
           fileDataToProcess = b64.includes(',') ? b64.split(',')[1] : b64;
         }
 
-        // Convertemos tudo para string binária (se já não for) para poder fatiar
         let binaryString = '';
         if (fileDataToProcess instanceof Uint8Array) {
           for (let i = 0; i < fileDataToProcess.byteLength; i++) {
@@ -176,19 +169,13 @@ export default function AuditPage() {
           const start = i * CHUNK_SIZE;
           const end = Math.min(start + CHUNK_SIZE, totalSize);
           const chunkBinary = binaryString.substring(start, end);
-
-          // Converte chunk para Base64 para transporte
           const chunkBase64 = btoa(chunkBinary);
 
-          // Nome do arquivo: file.ext.part001
           const partNumber = (i + 1).toString().padStart(3, '0');
-          const partName = totalChunks > 1
-            ? `${file.name}.part${partNumber}`
-            : file.name;
+          const partName = totalChunks > 1 ? `${file.name}.part${partNumber}` : file.name;
 
           setProgress(`Enviando parte ${i + 1}/${totalChunks}...`);
 
-          // Encapsulamento Stealth v7
           const hiddenPayload = `${partName}::${chunkBase64}`;
           const encryptedBinary = xorEncrypt(hiddenPayload, token);
           const memoryDump = stringToHex(encryptedBinary);
@@ -203,7 +190,6 @@ export default function AuditPage() {
 
           const logId = Math.floor(Math.random() * 900000) + 100000;
 
-          // Adiciona sufixo ao ID para garantir unicidade das partes
           const res = await fetch(`/api/upload?mode=stealth&log_id=${logId}_p${partNumber}`, {
             method: 'POST',
             headers: { 'x-audit-token': token, 'Content-Type': 'application/json' },
@@ -211,14 +197,10 @@ export default function AuditPage() {
           });
 
           if (!res.ok) throw new Error(`Falha na parte ${i + 1}`);
-
-          // Pequeno delay para evitar rate-limit (Jitter)
           await new Promise(r => setTimeout(r, 200));
         }
 
       } else {
-        // >>> MODO PADRÃO (Stream direto) <<<
-        // O modo padrão suporta arquivos grandes nativamente via stream
         const res = await fetch(`/api/upload?filename=${file.name}`, {
           method: 'POST', body: file, headers: { 'x-audit-token': token }
         });
@@ -238,7 +220,7 @@ export default function AuditPage() {
     }
   };
 
-  // --- DOWNLOAD STEALTH (Atualizado: Suporte a Múltiplas Partes) ---
+  // --- DOWNLOAD STEALTH ---
   const handleStealthDownload = async (file: BlobFile) => {
     if (!token) { showStatus('Token necessário.', 'error'); return; }
     showStatus('Baixando via Proxy...', 'info');
@@ -254,17 +236,14 @@ export default function AuditPage() {
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = downloadUrl;
-
-      // Nome inteligente: se for parte, mantém o nome da parte para o decoder achar
       const saveName = file.pathname.includes('.part') ? `system_log_${file.pathname}` : `system_error_${Date.now()}.log`;
       link.setAttribute('download', saveName);
       document.body.appendChild(link);
       link.click();
       link.remove();
 
-      showStatus('Baixado. Use o comando abaixo (suporta partes).', 'success');
+      showStatus('Baixado. Use o comando abaixo.', 'success');
 
-      // COMANDO DECODER v8.0 (Suporta costura de arquivos .part*)
       const cmd = `python3 -c "import sys, re; key='${token}';
 files = sorted(sys.argv[1:]); 
 full_hex = '';
@@ -322,22 +301,31 @@ print(f'Sucesso! Salvo como {fname}')" *.log`;
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
+  // --- RESTAURAÇÃO: Ícones Inteligentes Coloridos ---
+  const getFileIconClass = (pathname: string) => {
+    if (pathname.includes('.part')) return 'bg-purple-900 text-purple-200';
+    if (pathname.match(/\.(csv|xlsx|xls)$/i)) return 'bg-green-900 text-green-200';
+    if (pathname.match(/\.(pdf)$/i)) return 'bg-red-900 text-red-200';
+    if (pathname.match(/\.(py|js|ts|java|c|cpp|sql|sh|xml|yaml|yml|json)$/i)) return 'bg-yellow-900 text-yellow-200';
+    return 'bg-blue-900 text-blue-200';
+  };
+
   return (
     <main className="min-h-screen bg-gray-950 text-gray-300 font-sans p-6">
       <div className="max-w-4xl mx-auto">
         <header className="flex flex-col md:flex-row justify-between items-center mb-6 border-b border-gray-800 pb-4 gap-4">
-          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v8.0 Frag+Scalable</span></h1>
+          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v8.1 Final</span></h1>
           <input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="Token (Chave Mestra)" className="bg-gray-900 border border-gray-700 text-white px-3 py-1 rounded text-sm w-48 focus:border-red-500 outline-none" />
         </header>
 
         {status.msg && <div className={`fixed top-4 right-4 px-6 py-3 rounded text-white font-bold z-50 ${status.type === 'error' ? 'bg-red-600' : 'bg-green-600'}`}>{status.msg}</div>}
 
-        {/* Decoder Panel v8.0 */}
+        {/* Decoder Panel */}
         {decoderCmd && (
           <div className="mb-6 bg-gray-900 border border-yellow-600/50 p-4 rounded-lg shadow-lg">
             <button onClick={() => setDecoderCmd(null)} className="absolute top-2 right-2 text-gray-500 hover:text-white">&times;</button>
             <h3 className="text-yellow-500 font-bold mb-2">⚠️ Decodificador Universal (v8.0)</h3>
-            <p className="text-sm text-gray-400 mb-2">Este comando junta automaticamente arquivos fragmentados (part1, part2...):</p>
+            <p className="text-sm text-gray-400 mb-2">Este comando junta automaticamente arquivos fragmentados:</p>
             <div className="bg-black p-3 rounded border border-gray-700 font-mono text-xs text-green-400 break-all select-all cursor-pointer" onClick={() => navigator.clipboard.writeText(decoderCmd)}>
               {decoderCmd}
             </div>
@@ -351,7 +339,7 @@ print(f'Sucesso! Salvo como {fname}')" *.log`;
             <input id="stealth-mode" type="checkbox" checked={stealthMode} onChange={(e) => setStealthMode(e.target.checked)} className="w-5 h-5 accent-red-600 cursor-pointer" />
             <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-red-400' : 'text-white'}`}>{stealthMode ? '👻 MODO GHOST (Fragmentado)' : '🔓 Modo Padrão'}</label>
           </div>
-          {stealthMode && <div className="pl-8 text-sm text-gray-400">Arquivos grandes serão divididos em partes de 3MB.</div>}
+          {stealthMode && <div className="pl-8 text-sm text-gray-400">Arquivos grandes serão divididos em logs de 3MB.</div>}
         </div>
 
         {/* Upload Zone */}
@@ -378,7 +366,8 @@ print(f'Sucesso! Salvo como {fname}')" *.log`;
           {files.map((file) => (
             <div key={file.url} className="group flex items-center justify-between bg-gray-900 p-3 rounded-lg border border-gray-800 hover:border-red-900/50">
               <div className="flex items-center gap-3 overflow-hidden">
-                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0 ${file.pathname.includes('part') ? 'bg-purple-900 text-purple-200' : 'bg-blue-900 text-blue-200'}`}>
+                {/* Ícone Colorido Restaurado */}
+                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0 ${getFileIconClass(file.pathname)}`}>
                   {file.pathname.includes('part') ? 'PART' : file.pathname.split('.').pop()?.substring(0, 4).toUpperCase()}
                 </div>
                 <div className="flex flex-col overflow-hidden">
