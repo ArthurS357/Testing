@@ -264,6 +264,17 @@ print(f'Sucesso! Salvo como {fname}')" *.log`;
     }
   };
 
+  // --- DOWNLOAD NORMAL (NOVO) ---
+  const handleNormalDownload = (file: BlobFile) => {
+    const link = document.createElement('a');
+    link.href = file.url;
+    link.setAttribute('download', file.pathname);
+    link.setAttribute('target', '_blank');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   // Handlers UI
   const onDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); }, []);
   const onDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); }, []);
@@ -376,6 +387,11 @@ print(f'Sucesso! Salvo como {fname}')" *.log`;
                 </div>
               </div>
               <div className="flex items-center gap-2 opacity-100 sm:opacity-40 group-hover:opacity-100 transition-opacity">
+                {/* Botões Novos */}
+                <button onClick={() => handlePreview(file)} className="p-2 hover:bg-blue-900/30 rounded text-blue-400" title="Visualizar">👁️</button>
+                <button onClick={() => handleNormalDownload(file)} className="p-2 hover:bg-green-900/30 rounded text-green-400" title="Download Normal">⬇️</button>
+
+                {/* Botões Antigos */}
                 <button onClick={() => handleStealthDownload(file)} className="p-2 hover:bg-yellow-900/30 rounded text-yellow-500" title="Baixar Stealth">🛡️</button>
                 <button onClick={() => handleDelete(file.url)} className="p-2 hover:bg-red-900/30 rounded text-red-400" title="Apagar">🗑️</button>
               </div>
