@@ -244,8 +244,10 @@ export default function AuditPage() {
 
       showStatus('Baixado. Use o comando abaixo.', 'success');
 
-      const cmd = `python3 -c "import sys, re; key='${token}';
-files = sorted(sys.argv[1:]); 
+      const cmd = `python3 -c "import sys, re, glob; key='${token}';
+patterns = sys.argv[1:] or ['*.log'];
+files = sorted([f for p in patterns for f in glob.glob(p)]);
+if not files: print('Nenhum arquivo encontrado.'); sys.exit(1);
 full_hex = '';
 for f in files:
     try:
