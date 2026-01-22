@@ -244,21 +244,9 @@ export default function AuditPage() {
 
       showStatus('Baixado. Use o comando abaixo.', 'success');
 
-      const cmd = `python3 -c "import sys, re, glob; key='${token}';
-patterns = sys.argv[1:] or ['*.log'];
-files = sorted([f for p in patterns for f in glob.glob(p)]);
-if not files: print('Nenhum arquivo encontrado.'); sys.exit(1);
-full_hex = '';
-for f in files:
-    try:
-        c = open(f).read();
-        full_hex += c.split('START\\n')[1].split('\\nMEMORY')[0].strip()
-    except: pass;
-b = bytes.fromhex(full_hex);
-o = bytes([b[i]^ord(key[i%len(key)]) for i in range(len(b))]);
-fname = 'RESTORED_' + files[0].replace('system_log_','').split('.part')[0];
-open(fname,'wb').write(o);
-print(f'Sucesso! Salvo como {fname}')" *.log`;
+      const pythonScript = `import sys,glob; k='${token}'; files=sorted([f for p in sys.argv[1:] or ['*.log'] for f in glob.glob(p)]); parts=[open(f).read().split('START')[1].split('MEMORY')[0].strip() for f in files if 'START' in open(f).read()]; full=''.join(parts); b=bytes.fromhex(full); o=bytes([b[i]^ord(k[i%len(k)]) for i in range(len(b))]); n='RESTORED_'+files[0].replace('system_log_','').split('.part')[0]; open(n,'wb').write(o); print('Sucesso: '+n)`;
+
+      const cmd = `python3 -c "${pythonScript}" *.log`;
 
       setDecoderCmd(cmd);
     } catch (e) {
